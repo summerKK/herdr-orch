@@ -56,7 +56,13 @@ python3 orch.py <repo-root> "<任务描述>" --skip-perm
 
 **权限这三档必须选一档,不给会丢工作。** 实测(Desmos,10k 行真实项目):不给任何一档,implement 阶段第一次改文件就弹「Do you want to make this edit to dft.ts?」,编排器按设计返回 blocked 退出 —— 屏幕上已经是一份正确的 diff,而磁盘上零字节,一个阶段的思考白扔。
 
-而 `--skip-perm` 在**嵌套 agent 环境里可能整条不可用**:它对 claude/agy 翻译成 `--dangerously-skip-permissions`,如果编排器本身跑在某个 agent harness 里,上层权限策略会把这条命令直接拦掉(实测被 Claude Code 的自动模式分类器拒绝)。这种场景下用 `--accept-edits`:它给 claude 的是 `--permission-mode acceptEdits`,只放开文件编辑。`agy` 没有对应档位,`codex` 靠 `KIND_ARGS` 里的 `-a never` 关命令审批、写文件本身不弹框,两者都不需要这个 flag。
+而 `--skip-perm` 在**嵌套 agent 环境里可能整条不可用**:它对 claude/agy 翻译成 `--dangerously-skip-permissions`,如果编排器本身跑在某个 agent harness 里,上层权限策略会把这条命令直接拦掉(实测被 Claude Code 的自动模式分类器拒绝)。这种场景下用 `--accept-edits`。
+
+`--accept-edits` 给 claude 的是 `--permission-mode acceptEdits` **加一份验证命令白名单**。白名单不是可选的:`acceptEdits` 只覆盖文件编辑,不覆盖 Bash。实测同一次 Desmos 跑,fix 的编辑全部免确认应用了(642 行落盘),但它接着要跑 `npx vitest run` 自验时照样 blocked。implement/fix 改完必然跑测试,verify 阶段本身只跑命令 —— 只给 `acceptEdits` 等于把 blocked 从"第一次编辑"推迟到"第一次跑命令"。
+
+白名单(`VERIFY_CMDS`)是刻意窄的:测试/构建/lint/包管理器和只读 git。`git push`、`git reset`、`rm`、`curl` 这类不在里面,仍然会停下来问人。
+
+`agy` 没有对应档位(见已知边界),`codex` 靠 `KIND_ARGS` 里的 `-a never` 关命令审批、写文件本身不弹框,两者都不需要这个 flag。
 
 ## 产出
 
@@ -156,11 +162,16 @@ Herdr 和各家 CLI 的交界处有些时序问题,编排器自己兜。
 
 ## 已知边界
 
-- **双审目前是纯开销**。实测两个 reviewer 提的是同样 4 个问题,只是措辞不同。原因可能是 review 的 7 条检查清单太具体,消掉了"不同视角"的空间。要让双审有意义,得给两个 reviewer 不同的清单 —— 那是另一个设计。findings 不做程序化去重(前 80 字符对不上,`文件:行` 又全指向同一处),由 fix 按语义归并。
+- **双审目前是纯开销**。实测两个 reviewer 提的是同样 4 个问题,只是措辞不同。原因可能是 review 的 7 条检查清单太具体,消掉了"不同视角"的空间。要让双审有意义,得给两个 reviewer 不同的清单 —— 那是另一个设计。findings 不做程序化去重(前 80 字符对不上,`文件:行` 又全指向同一处),由 fix 按语义归并 —— 只在**两个来源都真的提了意见**时才这样(否则 `double` 不置位,fix 拿普通 prompt;实测副审被打断、0 条 findings 时,fix 收到归并指令后自己发现"6 条全来自 codex,无跨源重复",指令空转)。
+
+  Desmos 那次没能给这条结论提供新证据:副审 agy 报了 `ok` 且 0 findings,但它中途被命令审批打断过,无法区分"审完认为没问题"和"没审到那些点"。而主审 codex 提的 6 条里有一条是真问题且我自己核对时漏掉的(见下),所以 review 本身不是冗余 —— 冗余的可能只是"第二个 reviewer 用同一份清单"。
 - **scan 在小仓库是纯开销**。它给出的"只有一个函数、无测试框架、无构建配置"这类信息,implement 自己几秒就能看出来。大仓库里"目标涉及哪些文件、该跑哪条命令验证"才值得先勘查。
-- **`--resume` 只认得"最后一次 blocked"**。它靠 `state.json` 里的单条 `blocked` 记录接回,所以同一时刻只能有一个待接回的阶段。双审两个 reviewer 前后都 blocked 时,后一条会盖掉前一条 —— 先接回后者,前者退化成重跑。
+- **`--resume` 靠 `state.json` 里的 `blocked` 表接回**,按 slot 存,一次跑里多个阶段先后 blocked 互不覆盖(实测过 review2 被 fix 覆盖那种情况)。但记录只在同一个 `.orch/` 下有效,换 root 或删掉 `.orch/` 就接不回了。
+- **`--accept-edits` 对 agy 无效**。agy 只有 `--dangerously-skip-permissions` 一档全开,没有"只放开编辑"这一级。实测:review2 的 agy 卡在 `git diff` 的命令审批框上,双审在这一档下必然退化成单审。启动时会警告,要无人值守跑完就用 `--skip-perm`。
 - **单阶段最坏耗时曾是声称值的两倍**。`agent_prompt(wait=True)` 和之后的文件轮询原本各拿一份完整 `timeout_sec`。已修成共用一个 deadline(wait 拿剩余预算的 80%),实测 `timeout_sec=120` 时阶段实耗 120s,旧行为 240s。但仍**没有全局预算上限** —— 5 阶段串行只是各自不再翻倍。
-- **`fix → verify` 多轮回环和 `salvage()` 仍未在真实项目上验证**。回环只在单元测试里走过,`salvage()` 只在刻意造的超时场景触发过一次。Desmos 那次流水线停在 implement,没走到 review 之后 —— 所以下面"双审是纯开销"那条结论,目前仍只有玩具仓库的证据。
+- **`salvage()` 仍未在真实项目上验证**,只在刻意造的超时场景触发过一次。`fix → verify` 的多轮回环也只在单元测试里走过 —— Desmos 那次 verify 一轮就过。
+
+  完整链路本身跑通了:`implement(claude) → review(codex)+review2(agy) → fix(claude) → verify(codex)`,`final_stage=verify status=ok`。verify 独立跑了 vitest/lint/build 并数了断言条数核对文件内容,没有替 fix 圆场。产出质量另经独立核对(未采信 agent 自报):175 测试连跑 5 次全过,用另写的 oracle 复验数值语义 14/14。
 - **严格串行**。review 和 review2 完全独立,本可以并行。
 - **workspace 靠 label 猜**。原来硬取 `workspaces[0]`,实测在 Desmos 上取到的是 herdr-orch 自己的 workspace —— `tab_create` 带 cwd 所以功能不出错,但 pane 全建到了无关 workspace 里。现在按 `root` 的目录名匹配 label,匹配不上退回第一个并记日志。目录名和 label 不一致时仍会落到兜底路径。
 - `--kind` 统一模式没怎么实测,异构才是主路径。

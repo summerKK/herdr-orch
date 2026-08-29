@@ -98,7 +98,7 @@ SKIP_PERM_ARGS = {
     "codex": [],
 }
 
-# 中间档:自动批准文件编辑,但保留命令审批和目录信任框。
+# 中间档:自动批准文件编辑和验证命令,但保留其余命令审批和目录信任框。
 #
 # 为什么需要它 —— 实测 Desmos(10k 行真实项目):不给任何权限 flag,
 # implement 阶段第一次改 dft.ts 就弹「Do you want to make this edit to
@@ -107,14 +107,33 @@ SKIP_PERM_ARGS = {
 # 而 --skip-perm 那一档在嵌套 agent 环境里又会被上层权限策略整条拦掉。
 # 「每次编辑都点」和「全跳过」之间本来缺这一级。
 #
+# 为什么还要带 --allowedTools —— acceptEdits 只覆盖文件编辑,不覆盖 Bash。
+# 实测同一次 Desmos 跑:fix 的编辑全部免确认应用了(642 行落盘),但它接着要
+# 跑 `npx vitest run` 自验时照样 blocked(「This command requires approval」)。
+# implement/fix 改完必然跑测试,verify 阶段本身只跑命令 —— 只给 acceptEdits
+# 等于把 blocked 从"第一次编辑"推迟到"第一次跑命令",流水线仍走不完。
+# 所以放开验证类命令。白名单是刻意窄的:测试/构建/lint/包管理器和只读 git,
+# 危险动作(git push/reset、rm、curl 管道等)不在里面,仍然会停下来问人。
+VERIFY_CMDS = ("npx *", "npm *", "pnpm *", "yarn *", "bun *",
+               "make *", "just *", "cargo *", "go *",
+               "python *", "python3 *", "pytest *", "uv *",
+               "git diff*", "git status*", "git log*", "git show*")
+
 # codex 的命令审批由 KIND_ARGS 里的 -a never 关掉,写文件本身不弹框,
-# 所以它不需要额外 flag。agy 没有对应档位 —— 只能全跳过,留空表示
-# 这一档对它无效(调用方给了也不会误传成别的语义)。
+# 所以它不需要额外 flag。
+# agy 没有对应档位 —— 只有 --dangerously-skip-permissions 一档全开。留空的
+# 后果实测过:review2 的 agy 卡在 `git diff` 的命令审批框上,双审在这一档下
+# 必然退化成单审。这是 agy 的能力缺口,编排器只能如实反映(见 warn_kinds)。
 ACCEPT_EDITS_ARGS = {
-    "claude": ["--permission-mode", "acceptEdits"],
+    "claude": ["--permission-mode", "acceptEdits",
+               "--allowedTools", " ".join(f"Bash({c})" for c in VERIFY_CMDS)],
     "codex": [],
     "agy": [],
 }
+
+# --accept-edits 对这些 kind 无效(它们没有"只放开编辑"这一档)。
+# 启动时警告一次,免得人以为流水线能无人值守跑完却在半路卡住。
+ACCEPT_EDITS_UNSUPPORTED = ("agy",)
 
 # 各 kind 的信任框文案。herdr 对 codex 有 trust_directory 规则,对 agy 没有,
 # 所以 agy 卡在信任框时会被误报成 idle→done,流水线要等到超时才发现。
@@ -336,8 +355,14 @@ class Run:
         Desmos 实测的代价:implement 思考两分钟、屏幕上已是正确 diff,
         blocked 退出后那份实现无从取回。
         所以把 slot/kind/agent/pane 落进 state.json,--resume 靠它接回轮询。
+
+        按 slot 存,不是单条。原来是单条 blocked,实测被覆盖过:
+          review2(agy) blocked -> 记下 wC:p3
+          fix(claude) blocked  -> 覆盖成 wC:p4,agy 那条没了
+        agy 的 pane 还活着(它后来自己把副审做完写出了 review2.json),
+        但编排器已无从接回。一次跑里多个阶段先后 blocked 是常态。
         """
-        self.state["blocked"] = {
+        self.state.setdefault("blocked", {})[slot] = {
             "slot": slot, "kind": kind, "agent": name, "pane": pane,
             "t": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
@@ -347,7 +372,11 @@ class Run:
         return {"status": "blocked", "summary": summary, "findings": []}
 
     def load_resume(self) -> dict | None:
-        """读上一次 blocked 留下的接回信息。agent 已经不在就作废。"""
+        """读上一次 blocked 留下的接回信息。agent 已经不在的条目作废。
+
+        返回 {slot: 记录} —— 一次跑里可能有多个阶段先后 blocked,
+        每个都要能接回。旧格式(单条记录)也认,免得升级后接不回上一跑。
+        """
         if not self.state_path.exists():
             return None
         try:
@@ -355,23 +384,38 @@ class Run:
         except (json.JSONDecodeError, OSError):
             return None
         b = old.get("blocked")
-        if not b or not b.get("agent"):
+        if not b:
             self.log("--resume: state.json 里没有 blocked 记录,按正常流程跑")
             return None
-        # agent 必须还活着 —— 名字只在它退出后才释放,拿不到状态就说明
-        # pane 被关了或 agent 挂了,接不回去,只能重跑。
-        try:
-            st = h.agent_status(b["agent"])
-        except Exception:
-            st = None
-        if st is None:
-            self.log(f"--resume: agent {b['agent']} 已不在({b.get('pane')} 大概被关了),"
-                     f"只能重跑 {b.get('slot')}")
+        # 旧格式兼容:单条记录(有 agent 键)包一层
+        entries = [b] if isinstance(b, dict) and b.get("agent") \
+            else list(b.values()) if isinstance(b, dict) else []
+
+        alive = {}
+        for e in entries:
+            if not e.get("agent"):
+                continue
+            # agent 必须还活着 —— 名字只在它退出后才释放,拿不到状态就说明
+            # pane 被关了或 agent 挂了,接不回去,只能重跑。
+            try:
+                st = h.agent_status(e["agent"])
+            except Exception:
+                st = None
+            if st is None:
+                self.log(f"--resume: agent {e['agent']} 已不在"
+                         f"({e.get('pane')} 大概被关了),只能重跑 {e.get('slot')}")
+                continue
+            alive[e["slot"]] = e
+            self.log(f"--resume: 接回 {e['slot']} @ {e['pane']} "
+                     f"(agent={e['agent']} kind={e.get('kind')} 当前状态={st})")
+        if not alive:
             return None
         self.state["history"] = old.get("history", [])
-        self.log(f"--resume: 接回 {b['slot']} @ {b['pane']} "
-                 f"(agent={b['agent']} kind={b.get('kind')} 当前状态={st})")
-        return b
+        # 还活着的记录要留着:这一跑的 state 是新骨架,不写回去就等于清空,
+        # 下一次 --resume 接不回那些还没处理完的阶段。
+        self.state["blocked"] = dict(alive)
+        self.save()
+        return alive
 
     def resume_stage(self, b: dict, timeout_sec=1800) -> dict:
         """接回一个 blocked 的阶段:不新建 pane、不重发 prompt,直接轮询结果。
@@ -393,7 +437,8 @@ class Run:
             while time.time() < deadline:
                 got = self.collect(slot)
                 if got:
-                    self.state.pop("blocked", None)
+                    # 只清这个 slot —— 别的阶段可能还在等人应答。
+                    self.state.get("blocked", {}).pop(slot, None)
                     self.save()
                     self.log(f"{slot}(resume): {got['status']} — "
                              f"{got.get('summary','')[:80]}")
@@ -413,7 +458,7 @@ class Run:
                     time.sleep(POLL_SEC)
                     got = self.collect(slot)
                     if got:
-                        self.state.pop("blocked", None)
+                        self.state.get("blocked", {}).pop(slot, None)
                         self.save()
                         return got
                     return self.salvage(slot, name, pane, "resume: agent 消失且无结果")
@@ -494,12 +539,12 @@ class Run:
         """
         slot = slot or stage
 
-        # --resume 的两条岔路,都只在 self._resume 还没被消费掉时成立:
+        # --resume 的两条岔路,都只在这一跑带了接回信息时成立:
         if self._resume:
-            # 1) 正是当初 blocked 的那个阶段 —— 接回去继续等,别新建 agent。
-            if self._resume.get("slot") == slot:
-                b, self._resume = self._resume, None
-                return self.resume_stage(b, timeout_sec)
+            # 1) 这个 slot 当初 blocked 过 —— 接回去继续等,别新建 agent。
+            #    从 dict 里取走(pop):接回过就不再是待接回状态。
+            if slot in self._resume:
+                return self.resume_stage(self._resume.pop(slot), timeout_sec)
             # 2) blocked 之前就跑完的阶段 —— 结果还在盘上,直接复用。
             #    不复用的话 resume 会把 implement/review 全部重跑一遍,
             #    那就退回"重跑本阶段"了,F5 等于没修。
@@ -695,14 +740,20 @@ class Run:
 
         n1 = len(primary.get("findings") or [])
         n2 = len(secondary.get("findings") or [])
-        self.log(f"双审: {pk} 提 {n1} 条, {second_kind} 提 {n2} 条 "
-                 f"—— 两份都给 fix,由它按语义合并")
+        # double 只在真有两个来源提了意见时才置 —— 它唯一的作用是让 fix 拿到
+        # fix_double 那份"按语义归并两个 reviewer"的 prompt。实测 Desmos:
+        # 副审被命令审批打断、0 条 findings,fix 仍收到归并指令,自己发现
+        # 「6 条 findings 全来自 [codex]，无跨源重复」—— 指令空转。
+        double = n1 > 0 and n2 > 0
+        self.log(f"双审: {pk} 提 {n1} 条, {second_kind} 提 {n2} 条 —— "
+                 + ("两份都给 fix,由它按语义合并" if double
+                    else "只有一个来源有意见,fix 按普通流程修"))
         return {
             "status": status,
             "summary": f"[{pk}] {primary.get('summary','')} "
                        f"|| [{second_kind}] {secondary.get('summary','')}",
             "findings": merged,
-            "double": True,          # 让 fix 的 prompt 知道要去重
+            "double": double,        # 让 fix 的 prompt 知道要不要去重
             "files_changed": [],
         }
 
@@ -731,6 +782,22 @@ class Run:
             self._resume = self.load_resume()
         self.ws = self.pick_workspace()
         self.log(f"workspace={self.ws} root={self.root}")
+
+        # --accept-edits 对某些 kind 无效,提前说清哪个阶段会卡。
+        # 实测:agy 在这一档下卡在 `git diff` 的命令审批框,双审退化成单审。
+        if self.accept_edits:
+            weak = [(s, k) for s in STAGES
+                    for k in [self.stage_kind(s)]
+                    if k in ACCEPT_EDITS_UNSUPPORTED]
+            if double:
+                weak.append(("review2", REVIEW_SECOND_KIND))
+            weak = [(s, k) for s, k in weak if k in ACCEPT_EDITS_UNSUPPORTED]
+            if weak:
+                self.log("--accept-edits 对 "
+                         f"{'/'.join(sorted({k for _, k in weak}))} 无效"
+                         f"(没有'只放开编辑'这一档) —— "
+                         f"{', '.join(s for s, _ in weak)} 阶段可能卡在命令审批。"
+                         f"要无人值守跑完就用 --skip-perm")
 
         # scan 默认关。实测在小仓库里是纯开销 —— e2e 那次它给的 5 条
         # (只有 add、无测试框架、无构建配置、snake_case、无全局状态)
@@ -792,8 +859,11 @@ if __name__ == "__main__":
         print("  给了 --kind 则全阶段统一用它(调试/对照用)")
         print("  --skip-perm 按 kind 翻译成各 CLI 的跳过权限 flag;"
               "异构模式下别用 -- 透传这类 flag")
-        print("  --accept-edits 中间档:只自动批准文件编辑,命令审批和信任框仍留给人。"
+        print("  --accept-edits 中间档:自动批准文件编辑 + 验证类命令"
+              "(测试/构建/lint/只读 git),其余命令审批和信任框仍留给人。"
               "两档同给时以 --skip-perm 为准")
+        print(f"  --accept-edits 对 {'/'.join(ACCEPT_EDITS_UNSUPPORTED)} 无效"
+              f"(没有这一档),那些阶段会卡在命令审批")
         print("  一档都不给时 implement 第一次改文件就会 blocked,该阶段的工作丢弃")
         print("  --resume blocked 后人工应答完,接回原 agent 继续等结果;"
               "已跑完的阶段复用盘上结果,不重跑")
