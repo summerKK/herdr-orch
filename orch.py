@@ -33,6 +33,10 @@ POLL_SEC = 3
 # 补 enter 前至少等这么久。反向判据(见 nudge_submit)会在 agent 刚受理
 # prompt、还没打出输出的窗口里也判"该补",等一等让它露出活动迹象。
 NUDGE_WAIT = 45
+# nudge_submit 扫多少行找活动迹象。必须大于 herdr 状态栏的高度 ——
+# 状态栏(Session/Model/分支/manual mode)常占 4 行且永远在最底部,
+# 窗口太小就只能扫到它,真正的活动行在它上面。
+NUDGE_SCAN_LINES = 14
 # 全部阶段,按执行顺序。scan/report 是可选的两头 —— 见 ADVISORY_STAGES。
 STAGES = ["scan", "implement", "review", "fix", "verify", "report"]
 
@@ -92,6 +96,24 @@ SKIP_PERM_ARGS = {
     "claude": ["--dangerously-skip-permissions"],
     "agy": ["--dangerously-skip-permissions"],
     "codex": [],
+}
+
+# 中间档:自动批准文件编辑,但保留命令审批和目录信任框。
+#
+# 为什么需要它 —— 实测 Desmos(10k 行真实项目):不给任何权限 flag,
+# implement 阶段第一次改 dft.ts 就弹「Do you want to make this edit to
+# dft.ts?」,编排器按设计返回 blocked 退出。agent 屏幕上已经是一份正确的
+# diff,但磁盘上零字节 —— 编辑卡在框里,一个阶段的工作白扔。
+# 而 --skip-perm 那一档在嵌套 agent 环境里又会被上层权限策略整条拦掉。
+# 「每次编辑都点」和「全跳过」之间本来缺这一级。
+#
+# codex 的命令审批由 KIND_ARGS 里的 -a never 关掉,写文件本身不弹框,
+# 所以它不需要额外 flag。agy 没有对应档位 —— 只能全跳过,留空表示
+# 这一档对它无效(调用方给了也不会误传成别的语义)。
+ACCEPT_EDITS_ARGS = {
+    "claude": ["--permission-mode", "acceptEdits"],
+    "codex": [],
+    "agy": [],
 }
 
 # 各 kind 的信任框文案。herdr 对 codex 有 trust_directory 规则,对 agy 没有,
@@ -177,13 +199,17 @@ findings 放遗留问题(没有就空数组)。""",
 
 class Run:
     def __init__(self, root: Path, task: str, kind=None, agent_args=None,
-                 skip_perm=False):
+                 skip_perm=False, accept_edits=False):
         """kind=None 时按 STAGE_KIND 异构派活;给了具体 kind 就全阶段用它
         (调试和对照用)。
 
         skip_perm 是"跳过权限确认"这个意图,由 SKIP_PERM_ARGS 按 kind 翻译成
         各 CLI 自己的 flag。agent_args 是原样透传的额外参数 —— 异构模式下要
         当心,一种 CLI 的 flag 传给另一种会让它启动失败。
+
+        accept_edits 是中间档:只自动批准文件编辑,命令审批和信任框照旧留给人。
+        见 ACCEPT_EDITS_ARGS —— 不给任何一档时,implement 阶段第一次改文件就会
+        blocked,整个阶段的工作丢掉。
         """
         self.root = root
         self.dir = root / ".orch"
@@ -192,11 +218,18 @@ class Run:
         self.kind = kind
         self.agent_args = agent_args or []
         self.skip_perm = skip_perm
+        # skip_perm 更宽,已经含了 accept_edits 的效果 —— 同时给会让 claude
+        # 收到两个冲突的权限 flag,以 skip_perm 为准。
+        self.accept_edits = accept_edits and not skip_perm
         for d in (self.tasks, self.results):
             d.mkdir(parents=True, exist_ok=True)
         (self.tasks / "goal.md").write_text(task, encoding="utf-8")
         self.state_path = self.dir / "state.json"
+        # resume 从上一次的 state.json 读,所以 state 的初始化不能无条件清空它 ——
+        # 见 load_resume()。这里只准备一份干净的骨架,真正的读在 main() 里。
         self.state = {"stage": None, "history": [], "agent": None}
+        # 非 None 表示"这一跑是接着上次的 blocked 继续",由 stage_or_resume 消费。
+        self._resume = None
 
     # ---------- 状态 ----------
     def save(self):
@@ -217,12 +250,20 @@ class Run:
         args += SANDBOX_ARGS.get(kind, [])
         if self.skip_perm:
             args += SKIP_PERM_ARGS.get(kind, [])
+        elif self.accept_edits:
+            args += ACCEPT_EDITS_ARGS.get(kind, [])
         return args + self.agent_args
 
     # 屏幕上出现这些就说明 agent 真的在干活,别去打扰它。
     # 都是各家 TUI 的活动行前缀/文案,实测抓的。
+    # 后半段是各家 TUI 的"正在思考"文案。claude 的旋转词是随机的
+    # (Nebulizing/Pondering/…),靠不住,所以认它后面那截固定的进度括号:
+    # 「(2m 0s · ↓ 3.7k tokens · still thinking with high effort)」。
+    # 实测漏过一次:只有前半段符号时,claude 高强度思考中的 pane 命中 None。
     BUSY_MARKS = ("•", "└", "⎿", "▸", "●", "Working", "Explored", "Thought for",
-                  "esc to interrupt", "Ran ")
+                  "esc to interrupt", "Ran ",
+                  "still thinking", "tokens", "ctrl+t", "Thinking",
+                  "Reticulating", "✻", "✢", "✶", "✽", "∗")
 
     def nudge_submit(self, stage: str, name: str, pane: str, sent: str) -> bool:
         """agent 卡在"输入没提交"上?补一个 enter。
@@ -251,7 +292,12 @@ class Run:
         except Exception:
             # 读不到屏幕时保守起见仍然补 —— 走到这里已经说明没结果且 idle
             text = ""
-        tail = [l.strip() for l in text.splitlines() if l.strip()][-4:]
+        # 取尾部 NUDGE_SCAN_LINES 行,不是 4 行。herdr pane 底部固定挂着状态栏
+        # (Session/Model/分支/manual mode 共约 4 行),只看 4 行的话扫到的永远
+        # 是状态栏,活动行在它上面。实测 claude implement 阶段:活动行
+        # 「✶ Nebulizing… (2m 0s · still thinking with high effort)」在距底 8 行,
+        # 4 行窗口命中 None —— 正在高强度思考的 agent 会被判成"无活动迹象"补 enter。
+        tail = [l.strip() for l in text.splitlines() if l.strip()][-NUDGE_SCAN_LINES:]
         busy = next((m for m in self.BUSY_MARKS
                      for l in tail if l.startswith(m) or m in l), None)
         if busy:
@@ -279,6 +325,103 @@ class Run:
         except Exception:
             return None
         return next((p for p in TRUST_PATTERNS if p in text), None)
+
+    # ---------- blocked / resume ----------
+    def mark_blocked(self, slot, kind, name, pane, summary) -> dict:
+        """记下"接回去需要的东西",然后返回 blocked。
+
+        blocked 不是终点:pane 和 agent 都还活着(cleanup 被 keep=True 跳过,
+        实测人点完框之后 agent 会接着干完并写出结果文件)。原来这里只返回
+        status,进度全丢 —— 人点完框只能重跑本阶段,一个全新 agent 从零开始。
+        Desmos 实测的代价:implement 思考两分钟、屏幕上已是正确 diff,
+        blocked 退出后那份实现无从取回。
+        所以把 slot/kind/agent/pane 落进 state.json,--resume 靠它接回轮询。
+        """
+        self.state["blocked"] = {
+            "slot": slot, "kind": kind, "agent": name, "pane": pane,
+            "t": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self.save()
+        self.log(f"{slot}: 已记录接回信息(agent={name} pane={pane})。"
+                 f"人工应答后用 --resume 接回,不必重跑本阶段")
+        return {"status": "blocked", "summary": summary, "findings": []}
+
+    def load_resume(self) -> dict | None:
+        """读上一次 blocked 留下的接回信息。agent 已经不在就作废。"""
+        if not self.state_path.exists():
+            return None
+        try:
+            old = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        b = old.get("blocked")
+        if not b or not b.get("agent"):
+            self.log("--resume: state.json 里没有 blocked 记录,按正常流程跑")
+            return None
+        # agent 必须还活着 —— 名字只在它退出后才释放,拿不到状态就说明
+        # pane 被关了或 agent 挂了,接不回去,只能重跑。
+        try:
+            st = h.agent_status(b["agent"])
+        except Exception:
+            st = None
+        if st is None:
+            self.log(f"--resume: agent {b['agent']} 已不在({b.get('pane')} 大概被关了),"
+                     f"只能重跑 {b.get('slot')}")
+            return None
+        self.state["history"] = old.get("history", [])
+        self.log(f"--resume: 接回 {b['slot']} @ {b['pane']} "
+                 f"(agent={b['agent']} kind={b.get('kind')} 当前状态={st})")
+        return b
+
+    def resume_stage(self, b: dict, timeout_sec=1800) -> dict:
+        """接回一个 blocked 的阶段:不新建 pane、不重发 prompt,直接轮询结果。
+
+        人点完框之后 agent 会自己接着干完 —— 我们要做的只是重新开始等它的
+        结果文件。所以这里是 run_stage 的轮询段,去掉了 tab_create/agent_start/
+        agent_prompt,也不 unlink 结果文件(那正是我们要等的东西)。
+        """
+        slot, name, pane = b["slot"], b["agent"], b["pane"]
+        self.state["stage"] = slot
+        self.state["agent"] = name
+        self.state["pane"] = pane
+        self.state["kind"] = b.get("kind")
+        self.save()
+
+        deadline = time.time() + timeout_sec
+        keep = False
+        try:
+            while time.time() < deadline:
+                got = self.collect(slot)
+                if got:
+                    self.state.pop("blocked", None)
+                    self.save()
+                    self.log(f"{slot}(resume): {got['status']} — "
+                             f"{got.get('summary','')[:80]}")
+                    return got
+                st = h.agent_status(name)
+                if st == "blocked":
+                    # 还卡着 —— 一个阶段弹多个框是常态(claude 每改一个文件问一次)。
+                    # 必须重新记一次:这一跑的 self.state 是全新的骨架,save() 一写
+                    # 就把上一跑的 blocked 覆盖没了,下次 --resume 就接不回来 ——
+                    # 恰好在最常见的场景下让 F5 失效。实测过。
+                    h.notify(f"orch: {slot} 仍需确认", f"去 {pane} 应答后再 --resume")
+                    self.log(f"{slot}(resume): 仍 blocked。屏幕:\n{h.agent_read(pane, 40)}")
+                    keep = True
+                    return self.mark_blocked(slot, b.get("kind"), name, pane,
+                                             "仍等人工确认")
+                if st is None:
+                    time.sleep(POLL_SEC)
+                    got = self.collect(slot)
+                    if got:
+                        self.state.pop("blocked", None)
+                        self.save()
+                        return got
+                    return self.salvage(slot, name, pane, "resume: agent 消失且无结果")
+                time.sleep(POLL_SEC)
+            return self.salvage(slot, name, pane, f"resume: {slot} 超时")
+        finally:
+            if not keep:
+                self.cleanup(pane, slot)
 
     # ---------- 契约 ----------
     def brief(self, stage: str, prev: dict | None, slot: str = None) -> Path:
@@ -350,10 +493,32 @@ class Run:
         同一份清单,两个 kind 各写自己的 slot。
         """
         slot = slot or stage
+
+        # --resume 的两条岔路,都只在 self._resume 还没被消费掉时成立:
+        if self._resume:
+            # 1) 正是当初 blocked 的那个阶段 —— 接回去继续等,别新建 agent。
+            if self._resume.get("slot") == slot:
+                b, self._resume = self._resume, None
+                return self.resume_stage(b, timeout_sec)
+            # 2) blocked 之前就跑完的阶段 —— 结果还在盘上,直接复用。
+            #    不复用的话 resume 会把 implement/review 全部重跑一遍,
+            #    那就退回"重跑本阶段"了,F5 等于没修。
+            done = self.collect(slot)
+            if done:
+                self.log(f"{slot}: --resume 复用上一跑的结果"
+                         f"({done['status']} — {done.get('summary','')[:60]})")
+                return done
+
         name = f"orch_{slot}"
         self.state["stage"] = slot
         self.state["agent"] = name
         self.save()
+
+        # 整个阶段(prompt 的 --wait + 之后的文件轮询)共用这一个 deadline。
+        # 原来两段各拿一份完整 timeout_sec:agent_prompt(wait=True) 最多阻塞
+        # 1800s,返回后轮询窗口又从 time.time() 重新起算 1800s —— 单阶段最坏
+        # 3600s,是声称值的两倍,5 阶段串行能到 5 小时。
+        deadline = time.time() + timeout_sec
 
         brief = self.brief(stage, prev, slot)
         stale = self.results / f"{slot}.json"
@@ -382,13 +547,18 @@ class Run:
                 self.log(f"{slot}: {kind} 卡在信任框(命中「{hit}」),"
                          f"herdr 报的是 {h.agent_status(name)}。去 {pane} 手动应答")
                 keep = True
-                return {"status": "blocked", "summary": f"{kind} 等信任确认",
-                        "findings": []}
+                return self.mark_blocked(slot, kind, name, pane,
+                                         f"{kind} 等信任确认")
 
             sent = f"读 {brief} 并按其中的输出契约执行。"
             try:
-                h.agent_prompt(name, sent,
-                               wait=True, timeout_ms=timeout_sec * 1000)
+                # wait 只用来省轮询开销,不作真值来源 —— 给它剩余预算的大部分,
+                # 留一截给后面的轮询去读刚写完的结果文件。
+                # 下限也必须夹在剩余预算内:预算本来就短的时候,
+                # 一个固定下限会把 wait 抬到比 timeout_sec 还长(单位混用过一次)。
+                left = max(0.0, deadline - time.time())
+                h.agent_prompt(name, sent, wait=True,
+                               timeout_ms=int(min(left, max(left * 0.8, 1)) * 1000))
             except h.HerdrServerError as e:
                 # agent_blocked 在 prompt 阶段就可能抛 —— 比如 claude 在陌生
                 # 目录里弹的信任确认框。这类框只能人来点(skill 明令不许自动
@@ -401,11 +571,10 @@ class Run:
                          f"去 {pane} 手动应答,然后重跑本阶段")
                 self.log(f"{slot}: prompt 时 blocked。屏幕:\n{h.agent_read(pane, 40)}")
                 keep = True   # 留着 pane 给人点,别在 finally 里关掉
-                return {"status": "blocked", "summary": "agent 启动即 blocked,等人工确认",
-                        "findings": []}
+                return self.mark_blocked(slot, kind, name, pane,
+                                         "agent 启动即 blocked,等人工确认")
 
-            # --wait 返回不代表做完了。独立轮询文件。
-            deadline = time.time() + timeout_sec
+            # --wait 返回不代表做完了。独立轮询文件,但用同一个 deadline。
             nudges, last_nudge = 0, time.time()
             while time.time() < deadline:
                 got = self.collect(slot)
@@ -435,7 +604,7 @@ class Run:
                     h.notify(f"orch: {slot} 卡住", "需要人工确认")
                     self.log(f"{slot}: blocked,已通知。屏幕:\n{h.agent_read(pane, 40)}")
                     keep = True   # 同上:等人工确认的 pane 必须留着
-                    return {"status": "blocked", "summary": "等人工确认", "findings": []}
+                    return self.mark_blocked(slot, kind, name, pane, "等人工确认")
                 if st is None:
                     # agent 退出了 name 就被清空 —— 但文件可能刚写完
                     time.sleep(POLL_SEC)
@@ -537,9 +706,30 @@ class Run:
             "files_changed": [],
         }
 
+    def pick_workspace(self) -> str:
+        """挑一个 workspace 建 tab。优先 label 跟 root 目录名对得上的那个。
+
+        原来是硬取 workspaces[0]。实测在 Desmos 上取到的是 w9(herdr-orch)
+        而不是 wC(Desmos) —— tab_create 带 cwd 所以功能不出错,但 pane 全建
+        到了无关的 workspace 里,多 workspace 下归属混乱、也不好收。
+        对不上就退回第一个(单 workspace 时行为不变)。
+        """
+        wss = h.call("workspace", "list")["workspaces"]
+        want = self.root.name.lower()
+        hit = next((w for w in wss if (w.get("label") or "").lower() == want), None)
+        if hit:
+            return hit["workspace_id"]
+        self.log(f"没有 label 匹配「{self.root.name}」的 workspace,"
+                 f"用 {wss[0]['workspace_id']}({wss[0].get('label')})")
+        return wss[0]["workspace_id"]
+
     def main(self, max_fix_rounds=2, with_scan=False, with_report=False,
-             double=True):
-        self.ws = h.call("workspace", "list")["workspaces"][0]["workspace_id"]
+             double=True, resume=False):
+        # resume 要在 pick_workspace 之前读:load_resume 会把上一跑的 history
+        # 接回来,而 pick_workspace 自己会写日志。
+        if resume:
+            self._resume = self.load_resume()
+        self.ws = self.pick_workspace()
         self.log(f"workspace={self.ws} root={self.root}")
 
         # scan 默认关。实测在小仓库里是纯开销 —— e2e 那次它给的 5 条
@@ -594,13 +784,19 @@ class Run:
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("用法: orch.py <repo-root> <任务描述> [--kind KIND] [--skip-perm] "
-              "[--scan] [--report] [--no-double] [-- <agent-args>]")
+        print("用法: orch.py <repo-root> <任务描述> [--kind KIND] "
+              "[--skip-perm | --accept-edits] "
+              "[--scan] [--report] [--no-double] [--resume] [-- <agent-args>]")
         print(f"  阶段: {' → '.join(STAGES)}  (review 默认双审)")
         print(f"  不给 --kind 则按阶段派活: {STAGE_KIND}")
         print("  给了 --kind 则全阶段统一用它(调试/对照用)")
         print("  --skip-perm 按 kind 翻译成各 CLI 的跳过权限 flag;"
               "异构模式下别用 -- 透传这类 flag")
+        print("  --accept-edits 中间档:只自动批准文件编辑,命令审批和信任框仍留给人。"
+              "两档同给时以 --skip-perm 为准")
+        print("  一档都不给时 implement 第一次改文件就会 blocked,该阶段的工作丢弃")
+        print("  --resume blocked 后人工应答完,接回原 agent 继续等结果;"
+              "已跑完的阶段复用盘上结果,不重跑")
         print(f"  --scan 打开勘查阶段(默认关,小仓库里是纯开销)")
         print(f"  --report 打开总结阶段(默认关,写 .orch/report.md)"
               f" —— {'/'.join(sorted(ADVISORY_STAGES))} 均不参与成败判定")
@@ -617,10 +813,12 @@ if __name__ == "__main__":
         kind = argv[i + 1]
         argv = argv[:i] + argv[i + 2:]
     flags = {f: f in argv for f in
-             ("--skip-perm", "--scan", "--report", "--no-double")}
+             ("--skip-perm", "--accept-edits", "--scan", "--report",
+              "--no-double", "--resume")}
     argv = [a for a in argv if a not in flags]
     sys.exit(Run(Path(argv[0]).resolve(), argv[1], kind, extra,
-                 flags["--skip-perm"]).main(
+                 flags["--skip-perm"], flags["--accept-edits"]).main(
                      with_scan=flags["--scan"],
                      with_report=flags["--report"],
-                     double=not flags["--no-double"]))
+                     double=not flags["--no-double"],
+                     resume=flags["--resume"]))
